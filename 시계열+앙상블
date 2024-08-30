@@ -1,0 +1,270 @@
+import os
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, LabelEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, IsolationForest
+from sklearn.manifold import TSNE
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
+from sklearn.metrics import f1_score, confusion_matrix, classification_report
+from sklearn.feature_selection import SelectFromModel, mutual_info_classif
+from imblearn.over_sampling import ADASYN
+from imblearn.pipeline import Pipeline as ImbPipeline
+import optuna
+from tsfresh import extract_features, select_features
+from tsfresh.feature_extraction import MinimalFCParameters
+
+# 설정
+ROOT_DIR = "."
+RANDOM_STATE = 42
+N_TRIALS = 100
+
+def load_and_explore_data(file_path):
+    data = pd.read_csv(file_path)
+    print(f"Data loading complete. Shape: {data.shape}")
+    
+    # 기본 통계 정보 및 시각화 (이전과 동일)
+    
+    return data
+
+def extract_time_series_features(data):
+    # 시계열 특성 추출을 위해 가상의 시간 컬럼 생성
+    data['time'] = range(len(data))
+    
+    # 각 공정별로 시계열 특성 추출
+    processes = ['Dam', 'AutoClave', 'Fill1', 'Fill2']
+    ts_features = pd.DataFrame()
+    
+    for process in processes:
+        process_cols = [col for col in data.columns if f'_{process}' in col]
+        process_data = data[['time'] + process_cols]
+        
+        extracted_features = extract_features(process_data, column_id='time', column_sort='time',
+                                              default_fc_parameters=MinimalFCParameters())
+        
+        ts_features = pd.concat([ts_features, extracted_features], axis=1)
+    
+    return pd.concat([data, ts_features], axis=1)
+
+def preprocess_data(data, is_train=True):
+    # 'OK' 값을 np.nan으로 변환
+    data = data.replace({'OK': np.nan})
+    
+    # 결측치가 80% 이상인 열 제거
+    threshold = 0.8
+    data = data.dropna(thresh=int((1-threshold) * len(data)), axis=1)
+    
+    # 공정별로 컬럼 분리
+    processes = ['Dam', 'AutoClave', 'Fill1', 'Fill2']
+    process_cols = {process: [col for col in data.columns if f'_{process}' in col] for process in processes}
+    
+    # 수치형 컬럼과 범주형 컬럼을 분리
+    numeric_cols = data.select_dtypes(include=['int64', 'float64']).columns.tolist()
+    categorical_cols = data.select_dtypes(include=['object']).columns.tolist()
+    
+    if is_train and 'target' in categorical_cols:
+        categorical_cols.remove('target')
+    
+    # 공정별 특성 엔지니어링
+    for process in processes:
+        data[f'{process}_mean'] = data[process_cols[process]].mean(axis=1)
+        data[f'{process}_std'] = data[process_cols[process]].std(axis=1)
+        data[f'{process}_max'] = data[process_cols[process]].max(axis=1)
+        data[f'{process}_min'] = data[process_cols[process]].min(axis=1)
+    
+    # 전처리 파이프라인 설정
+    numeric_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='mean')),
+        ('scaler', StandardScaler())
+    ])
+    
+    categorical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
+        ('onehot', OneHotEncoder(handle_unknown='ignore'))
+    ])
+    
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numeric_transformer, numeric_cols),
+            ('cat', categorical_transformer, categorical_cols)
+        ])
+    
+    return preprocessor, data
+
+def detect_outliers(X):
+    iso_forest = IsolationForest(contamination=0.1, random_state=RANDOM_STATE)
+    outliers = iso_forest.fit_predict(X)
+    return outliers == -1
+
+def visualize_tsne(X, y):
+    tsne = TSNE(n_components=2, random_state=RANDOM_STATE)
+    X_tsne = tsne.fit_transform(X)
+    
+    plt.figure(figsize=(10, 8))
+    sns.scatterplot(x=X_tsne[:, 0], y=X_tsne[:, 1], hue=y)
+    plt.title('t-SNE visualization of the data')
+    plt.savefig('tsne_visualization.png')
+    plt.close()
+
+def create_ensemble_model(trial):
+    models = []
+    weights = []
+    
+    n_models = trial.suggest_int('n_models', 3, 5)
+    
+    for i in range(n_models):
+        model_type = trial.suggest_categorical(f'model_{i}', ['rf', 'gb', 'xgb', 'lgbm', 'catboost'])
+        weight = trial.suggest_float(f'weight_{i}', 0.1, 1.0)
+        
+        if model_type == 'rf':
+            model = RandomForestClassifier(
+                n_estimators=trial.suggest_int(f'rf_n_estimators_{i}', 100, 1000),
+                max_depth=trial.suggest_int(f'rf_max_depth_{i}', 5, 30),
+                random_state=RANDOM_STATE
+            )
+        elif model_type == 'gb':
+            model = GradientBoostingClassifier(
+                n_estimators=trial.suggest_int(f'gb_n_estimators_{i}', 100, 1000),
+                learning_rate=trial.suggest_float(f'gb_learning_rate_{i}', 1e-3, 1.0, log=True),
+                max_depth=trial.suggest_int(f'gb_max_depth_{i}', 3, 10),
+                random_state=RANDOM_STATE
+            )
+        elif model_type == 'xgb':
+            model = XGBClassifier(
+                n_estimators=trial.suggest_int(f'xgb_n_estimators_{i}', 100, 1000),
+                learning_rate=trial.suggest_float(f'xgb_learning_rate_{i}', 1e-3, 1.0, log=True),
+                max_depth=trial.suggest_int(f'xgb_max_depth_{i}', 3, 10),
+                random_state=RANDOM_STATE
+            )
+        elif model_type == 'lgbm':
+            model = LGBMClassifier(
+                n_estimators=trial.suggest_int(f'lgbm_n_estimators_{i}', 100, 1000),
+                learning_rate=trial.suggest_float(f'lgbm_learning_rate_{i}', 1e-3, 1.0, log=True),
+                num_leaves=trial.suggest_int(f'lgbm_num_leaves_{i}', 20, 100),
+                random_state=RANDOM_STATE
+            )
+        else:  # catboost
+            model = CatBoostClassifier(
+                iterations=trial.suggest_int(f'catboost_iterations_{i}', 100, 1000),
+                learning_rate=trial.suggest_float(f'catboost_learning_rate_{i}', 1e-3, 1.0, log=True),
+                depth=trial.suggest_int(f'catboost_depth_{i}', 4, 10),
+                random_state=RANDOM_STATE
+            )
+        
+        models.append(model)
+        weights.append(weight)
+    
+    return models, weights
+
+def ensemble_predict(models, weights, X):
+    predictions = np.array([model.predict_proba(X)[:, 1] for model in models])
+    weighted_predictions = np.average(predictions, axis=0, weights=weights)
+    return (weighted_predictions > 0.5).astype(int)
+
+def objective(trial):
+    models, weights = create_ensemble_model(trial)
+    
+    pipeline = ImbPipeline([
+        ('preprocessor', preprocessor),
+        ('adasyn', ADASYN(random_state=RANDOM_STATE)),
+    ])
+    
+    scores = []
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    
+    for train_idx, val_idx in skf.split(X, y):
+        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        
+        X_train_processed = pipeline.fit_transform(X_train, y_train)
+        X_val_processed = pipeline.transform(X_val)
+        
+        for model in models:
+            model.fit(X_train_processed, y_train)
+        
+        y_pred = ensemble_predict(models, weights, X_val_processed)
+        score = f1_score(y_val, y_pred, pos_label='AbNormal')
+        scores.append(score)
+    
+    return np.mean(scores)
+
+if __name__ == "__main__":
+    train_data = load_and_explore_data(os.path.join(ROOT_DIR, "train.csv"))
+    test_data = load_and_explore_data(os.path.join(ROOT_DIR, "test.csv"))
+
+    # 시계열 특성 추출
+    train_data = extract_time_series_features(train_data)
+    test_data = extract_time_series_features(test_data)
+
+    preprocessor, train_data_processed = preprocess_data(train_data)
+    _, test_data_processed = preprocess_data(test_data, is_train=False)
+
+    X = train_data_processed.drop('target', axis=1)
+    y = train_data_processed['target']
+
+    # 이상치 탐지
+    outliers = detect_outliers(X)
+    print(f"Number of outliers detected: {sum(outliers)}")
+
+    # t-SNE 시각화
+    visualize_tsne(X, y)
+
+    study = optuna.create_study(direction='maximize')
+    study.optimize(objective, n_trials=N_TRIALS)
+
+    print(f'Best trial: score {study.best_value:.4f}, params {study.best_params}')
+
+    best_models, best_weights = create_ensemble_model(study.best_trial)
+    
+    pipeline = ImbPipeline([
+        ('preprocessor', preprocessor),
+        ('adasyn', ADASYN(random_state=RANDOM_STATE)),
+    ])
+
+    X_processed = pipeline.fit_transform(X, y)
+    for model in best_models:
+        model.fit(X_processed, y)
+
+    # 검증 데이터에 대한 성능 평가
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, stratify=y, random_state=RANDOM_STATE)
+    X_train_processed = pipeline.fit_transform(X_train, y_train)
+    X_val_processed = pipeline.transform(X_val)
+    
+    for model in best_models:
+        model.fit(X_train_processed, y_train)
+    
+    val_pred = ensemble_predict(best_models, best_weights, X_val_processed)
+    print("Validation Performance:")
+    print(classification_report(y_val, val_pred))
+    print("Confusion Matrix:")
+    print(confusion_matrix(y_val, val_pred))
+
+    # 테스트 데이터 예측
+    X_test_processed = pipeline.transform(test_data_processed)
+    test_pred = ensemble_predict(best_models, best_weights, X_test_processed)
+
+    # 제출 파일 작성
+    submission = pd.DataFrame({"Set ID": test_data['Set ID'], "target": test_pred})
+    submission.to_csv(os.path.join(ROOT_DIR, "submission.csv"), index=False)
+    print("Submission file created successfully.")
+
+    # 특성 중요도 시각화 (랜덤 포레스트 모델이 있는 경우)
+    rf_models = [model for model in best_models if isinstance(model, RandomForestClassifier)]
+    if rf_models:
+        feature_names = pipeline.named_steps['preprocessor'].get_feature_names_out()
+        feature_importance = rf_models[0].feature_importances_
+        
+        plt.figure(figsize=(12, 8))
+        sns.barplot(x=feature_importance, y=feature_names)
+        plt.title('Feature Importance (Random Forest)')
+        plt.tight_layout()
+        plt.savefig('feature_importance.png')
+        plt.close()
